@@ -27,7 +27,8 @@ import (
 )
 
 var (
-	log = logging.DefaultLogger.WithField(logfields.LogSubsys, "egressgateway")
+	log      = logging.DefaultLogger.WithField(logfields.LogSubsys, "egressgateway")
+	zeroIPv4 = net.ParseIP("0.0.0.0")
 )
 
 type k8sCacheSyncedChecker interface {
@@ -298,7 +299,7 @@ func (manager *Manager) addMissingIpRulesAndRoutes(isRetry bool) (shouldRetry bo
 	}
 
 	for _, policyConfig := range manager.policyConfigs {
-		policyConfig.forEachEndpointAndDestination(manager.epDataStore, addIPRulesAndRoutesForConfig)
+		policyConfig.forEachEndpointAndDestinationMinusExcludedCIDRs(manager.epDataStore, addIPRulesAndRoutesForConfig)
 	}
 
 	return
@@ -323,7 +324,7 @@ nextIpRule:
 		}
 
 		for _, policyConfig := range manager.policyConfigs {
-			if policyConfig.matches(manager.epDataStore, matchFunc) {
+			if policyConfig.matchesMinusExcludedCIDRs(manager.epDataStore, matchFunc) {
 				continue nextIpRule
 			}
 		}
@@ -368,11 +369,16 @@ func (manager *Manager) addMissingEgressRules() {
 			egressPolicies[*key] = *val
 		})
 
-	addEgressRule := func(endpointIP net.IP, dstCIDR *net.IPNet, gwc *gatewayConfig) {
+	addEgressRule := func(endpointIP net.IP, dstCIDR *net.IPNet, excludedCIDR bool, gwc *gatewayConfig) {
 		policyKey := egressmap.NewEgressPolicyKey4(endpointIP, dstCIDR.IP, dstCIDR.Mask)
 		policyVal, policyPresent := egressPolicies[policyKey]
 
-		if policyPresent && policyVal.Match(gwc.egressIP.IP, gwc.gatewayIP) {
+		gatewayIP := gwc.gatewayIP
+		if excludedCIDR {
+			gatewayIP = zeroIPv4
+		}
+
+		if policyPresent && policyVal.Match(gwc.egressIP.IP, gatewayIP) {
 			return
 		}
 
@@ -380,10 +386,10 @@ func (manager *Manager) addMissingEgressRules() {
 			logfields.SourceIP:        endpointIP,
 			logfields.DestinationCIDR: dstCIDR.String(),
 			logfields.EgressIP:        gwc.egressIP.IP,
-			logfields.GatewayIP:       gwc.gatewayIP,
+			logfields.GatewayIP:       gatewayIP,
 		})
 
-		if err := egressmap.EgressPolicyMap.Update(endpointIP, *dstCIDR, gwc.egressIP.IP, gwc.gatewayIP); err != nil {
+		if err := egressmap.EgressPolicyMap.Update(endpointIP, *dstCIDR, gwc.egressIP.IP, gatewayIP); err != nil {
 			logger.WithError(err).Error("Error applying egress gateway policy")
 		} else {
 			logger.Debug("Egress gateway policy applied")
@@ -406,8 +412,13 @@ func (manager *Manager) removeUnusedEgressRules() {
 
 nextPolicyKey:
 	for policyKey, policyVal := range egressPolicies {
-		matchPolicy := func(endpointIP net.IP, dstCIDR *net.IPNet, gwc *gatewayConfig) bool {
-			return policyKey.Match(endpointIP, dstCIDR) && policyVal.Match(gwc.egressIP.IP, gwc.gatewayIP)
+		matchPolicy := func(endpointIP net.IP, dstCIDR *net.IPNet, excludedCIDR bool, gwc *gatewayConfig) bool {
+			gatewayIP := gwc.gatewayIP
+			if excludedCIDR {
+				gatewayIP = zeroIPv4
+			}
+
+			return policyKey.Match(endpointIP, dstCIDR) && policyVal.Match(gwc.egressIP.IP, gatewayIP)
 		}
 
 		for _, policyConfig := range manager.policyConfigs {

@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/ip"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sLabels "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
@@ -59,6 +60,7 @@ type PolicyConfig struct {
 
 	endpointSelectors []api.EndpointSelector
 	dstCIDRs          []*net.IPNet
+	excludedCIDRs     []*net.IPNet
 
 	policyGwConfig *policyGatewayConfig
 
@@ -177,8 +179,35 @@ func (gwc *gatewayConfig) deriveFromPolicyGatewayConfig(gc *policyGatewayConfig)
 	return nil
 }
 
+// destinationMinusExcludedCIDRs will return, for a given policy, a list of all
+// destination CIDRs to which the excluded CIDRs have been subtracted.
+func (config *PolicyConfig) destinationMinusExcludedCIDRs() []*net.IPNet {
+	if len(config.excludedCIDRs) == 0 {
+		return config.dstCIDRs
+	}
+
+	cidrs := []*net.IPNet{}
+
+	for _, dstCIDR := range config.dstCIDRs {
+		dstCIDRMinusExcludedCIDRs := []*net.IPNet{dstCIDR}
+		for _, excludedCIDR := range config.excludedCIDRs {
+			newDstCIDRMinuxExcludedCIDRs := []*net.IPNet{}
+			for _, cidr := range dstCIDRMinusExcludedCIDRs {
+				r, _, l := ip.PartitionCIDR(*cidr, *excludedCIDR)
+				newDstCIDRMinuxExcludedCIDRs = append(newDstCIDRMinuxExcludedCIDRs, append(r, l...)...)
+			}
+
+			dstCIDRMinusExcludedCIDRs = newDstCIDRMinuxExcludedCIDRs
+		}
+
+		cidrs = append(cidrs, dstCIDRMinusExcludedCIDRs...)
+	}
+
+	return cidrs
+}
+
 func (config *PolicyConfig) forEachEndpointAndDestination(epDataStore map[endpointID]*endpointMetadata,
-	f func(net.IP, *net.IPNet, *gatewayConfig)) {
+	f func(net.IP, *net.IPNet, bool, *gatewayConfig)) {
 
 	for _, endpoint := range epDataStore {
 		if !config.selectsEndpoint(endpoint) {
@@ -186,15 +215,39 @@ func (config *PolicyConfig) forEachEndpointAndDestination(epDataStore map[endpoi
 		}
 
 		for _, endpointIP := range endpoint.ips {
+			isExcludedCIDR := false
 			for _, dstCIDR := range config.dstCIDRs {
-				f(endpointIP, dstCIDR, &config.gatewayConfig)
+				f(endpointIP, dstCIDR, isExcludedCIDR, &config.gatewayConfig)
+			}
+
+			isExcludedCIDR = true
+			for _, excludedCIDR := range config.excludedCIDRs {
+				f(endpointIP, excludedCIDR, isExcludedCIDR, &config.gatewayConfig)
+			}
+		}
+	}
+}
+
+func (config *PolicyConfig) forEachEndpointAndDestinationMinusExcludedCIDRs(epDataStore map[endpointID]*endpointMetadata,
+	f func(net.IP, *net.IPNet, *gatewayConfig)) {
+
+	cidrs := config.destinationMinusExcludedCIDRs()
+
+	for _, endpoint := range epDataStore {
+		if !config.selectsEndpoint(endpoint) {
+			continue
+		}
+
+		for _, endpointIP := range endpoint.ips {
+			for _, cidr := range cidrs {
+				f(endpointIP, cidr, &config.gatewayConfig)
 			}
 		}
 	}
 }
 
 func (config *PolicyConfig) matches(epDataStore map[endpointID]*endpointMetadata,
-	f func(net.IP, *net.IPNet, *gatewayConfig) bool) bool {
+	f func(net.IP, *net.IPNet, bool, *gatewayConfig) bool) bool {
 
 	for _, endpoint := range epDataStore {
 		if !config.selectsEndpoint(endpoint) {
@@ -202,8 +255,38 @@ func (config *PolicyConfig) matches(epDataStore map[endpointID]*endpointMetadata
 		}
 
 		for _, endpointIP := range endpoint.ips {
+			isExcludedCIDR := false
 			for _, dstCIDR := range config.dstCIDRs {
-				if f(endpointIP, dstCIDR, &config.gatewayConfig) {
+				if f(endpointIP, dstCIDR, isExcludedCIDR, &config.gatewayConfig) {
+					return true
+				}
+			}
+
+			isExcludedCIDR = true
+			for _, excludedCIDR := range config.excludedCIDRs {
+				if f(endpointIP, excludedCIDR, isExcludedCIDR, &config.gatewayConfig) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func (config *PolicyConfig) matchesMinusExcludedCIDRs(epDataStore map[endpointID]*endpointMetadata,
+	f func(net.IP, *net.IPNet, *gatewayConfig) bool) bool {
+
+	cidr := config.destinationMinusExcludedCIDRs()
+
+	for _, endpoint := range epDataStore {
+		if !config.selectsEndpoint(endpoint) {
+			continue
+		}
+
+		for _, endpointIP := range endpoint.ips {
+			for _, cidr := range cidr {
+				if f(endpointIP, cidr, &config.gatewayConfig) {
 					return true
 				}
 			}
@@ -218,6 +301,7 @@ func (config *PolicyConfig) matches(epDataStore map[endpointID]*endpointMetadata
 func ParseCEGP(cegp *v2.CiliumEgressGatewayPolicy) (*PolicyConfig, error) {
 	var endpointSelectorList []api.EndpointSelector
 	var dstCidrList []*net.IPNet
+	var excludedCIDRs []*net.IPNet
 
 	allowAllNamespacesRequirement := slim_metav1.LabelSelectorRequirement{
 		Key:      k8sConst.PodNamespaceLabel,
@@ -247,6 +331,15 @@ func ParseCEGP(cegp *v2.CiliumEgressGatewayPolicy) (*PolicyConfig, error) {
 			return nil, err
 		}
 		dstCidrList = append(dstCidrList, cidr)
+	}
+
+	for _, cidrString := range cegp.Spec.ExcludedCIDRs {
+		_, cidr, err := net.ParseCIDR(string(cidrString))
+		if err != nil {
+			log.WithError(err).WithFields(logrus.Fields{logfields.CiliumEgressGatewayPolicyName: name}).Warn("Error parsing cidr.")
+			return nil, err
+		}
+		excludedCIDRs = append(excludedCIDRs, cidr)
 	}
 
 	for _, egressRule := range cegp.Spec.Selectors {
@@ -289,6 +382,7 @@ func ParseCEGP(cegp *v2.CiliumEgressGatewayPolicy) (*PolicyConfig, error) {
 	return &PolicyConfig{
 		endpointSelectors:  endpointSelectorList,
 		dstCIDRs:           dstCidrList,
+		excludedCIDRs:      excludedCIDRs,
 		matchedEndpointIDs: make(map[endpointID]struct{}),
 		policyGwConfig:     policyGwc,
 		id: types.NamespacedName{
