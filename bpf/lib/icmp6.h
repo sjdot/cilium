@@ -86,6 +86,11 @@ static __always_inline int icmp6_send_reply(struct __ctx_buff *ctx, int nh_off)
 
 	cilium_dbg_capture(ctx, DBG_CAPTURE_DELIVERY, ctx_get_ifindex(ctx));
 
+#ifdef ENABLE_ENDPOINT_ROUTES
+    ctx->mark &= ~MARK_MAGIC_HOST_MASK;
+    ctx->mark |= MARK_MAGIC_HOST;
+#endif
+
 	return redirect_self(ctx);
 }
 
